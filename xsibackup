@@ -1,0 +1,1088 @@
+#!/bin/sh
+#################################################################################
+#										#	
+#    XSIBACKUP Automated Backups for ESXi 5					#
+#    By Daniel J. Garcia Fidalgo (33HOPS) daniel.garcia@33hops.com		#
+#    Copyright (C) 2013  33HOPS, Sistemas de Informaci? y Redes, S.L.		#
+#										#
+#    This program is free software: you can redistribute it and/or modify	#
+#    it under the terms of the GNU General Public License as published by	#
+#    the Free Software Foundation, either version 3 of the License, or		#
+#    (at your option) any later version.					#
+#										#	
+#    This program is distributed in the hope that it will be useful,		#
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of		#
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the		#
+#    GNU General Public License for more details.				#
+#										#
+#    You should have received a copy of the GNU General Public License		#
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.	#
+#										#	
+#################################################################################
+
+HOSTNAME=$(hostname)
+
+CURRDIR=`dirname $0`
+
+longdate=`date '+%a, %d %b %Y %H:%M:%S %z'`
+newdirmask=$(date +%Y%m%d''%H%M%S)
+yearstring=$(date +%Y)
+
+OLDIFS=$IFS
+newline=$'\012'
+
+help=$'?33HOPS, Sistemas de Informacion y Redes, S.L. - 33hops.com - ?xsibackup 2.1.1\r
+Backup Utility for the ?VMware ESXi 5.X Hypervisor Series
+\n
+RULES:
+Arguments are a list of variable/value pairs separated by an equal sign. 
+You can use any character to define values with the exception of double quotes (") and the equal sign (=).
+You must double quote variables if you use spaces or any scapable character.
+\n
+USAGE:
+Example 1 (backup all running VMs):
+xsibackup --backup-point=/vmfs/volumes/backup --backup-type=running --mail-from=email.sender@yourdomain.com --mail-to=email.recipient@anotherdomain.com 
+--smtp-srv=smtp.yourdomain.com --smtp-port=25 --smtp-usr=username --smtp-pwd=password
+\n
+Example 2 (backup 3 VMs even if they are swiched off):
+xsibackup --backup-point=/vmfs/volumes/backup --backup-type=custom --backup-vms="WINDOWSVM1,LINUXVM2,New Virtual Machine" --mail-from=email.sender@yourdomain.com --mail-to=email.recipient@anotherdomain.com
+--smtp-srv=smtp.yourdomain.com --smtp-port=25 --smtp-usr=username --smtp-pwd=password
+\n
+OPTIONS:
+--backup-point		Full path to the backup mount point in the local server, it will tipically be under
+			/vmfs/volumes, i.e. /vmfs/volumes/backup.
+--backup-how		hot | cold
+			Hot (default): selected virtual machines are backed up without being switched off,
+			this is usefull for e-mail, http servers and VMs that cannot be switched off. If 
+			you do not specify a value for --backup-how a hot backup will be carried out.
+			Cold: selected VMs will be switched off before backup and turned on right afterwards.
+			Good if you need a reboot cicle from time to time to refresh resources and don\'t
+			mind having a little downtime. 
+--backup-type		custom | all | running
+			Custom: if this methos is chosen then a list of the VMs to backup must be passed to
+			the --backup-vms option.
+			All: backup -all- VMS.
+			Running: backup only running virtual machines.
+--backup-vms		List of virtual machines to backup as a colon separated list,
+			i.e: --backup-vms=VM1,VM2,VM3, only needed if custom is selected as the --backup-type
+--test-mode=true	Allows testing backup procedure and e-mail submission without having to wait for a
+			full backup process. In this mode VMs are not copied to the backup disk.
+--mail-from		E-mail address as from where the HTML e-mail report will be sent.
+--mail-to		E-mail address to which the HTML e-mail report will be sent.
+--subject		Set your own subject for the e-mail report
+--smtp-srv		SMTP server that we will use to send the HTML e-mail report through.
+--smtp-port		SMTP server port
+--smtp-usr		SMTP username we will use in the plain text SMTP authentication. Please note this is
+			the only authentication method supported by xsibackup\'s email client by now.
+--smtp-pwd		SMTP password used for authentication against the SMTP server.			
+'
+
+###############################################
+#             HELP CONTENT END                #
+###############################################
+
+
+###############################################
+#   BASE64 ASH NATIVE ENCODING FUNCTIONS      #
+###############################################
+# This are base64 encodig functions programmed to 
+# work natively in busybox present on ESXi 5.X?.
+# Needless to say they are not very efficient for
+# encoding big files, but very convenient to
+# encode SMTP usr & pwd on the other side and be
+# able to send e-mail from the stripped down ESXi
+# version.
+
+
+        base64arr="A B C D E F G H I J K L M N O P Q R S T U V W X Y Z a b c d e f g h i j k l m n o p q r s t u v w x y z 0 1 2 3 4 5 6 7 8 9 + /"
+
+        a=0
+        for car in $base64arr
+        do
+                eval char$a=$car
+        a=$(($a+1))
+        done
+
+dec_to_bin(){
+
+        n=$1
+        b=1
+        while [ $n -ge 2 ]
+        do
+                binstr="$(($n % 2))"$binstr
+        n=$(($n/2))
+        b=$(($b+1))
+        done
+        echo `printf "%0$(($(($b/8+1))*8))d" $(echo $n$binstr | sed 's/^0*//')`
+}
+
+bin_to_dec(){
+
+        binnum=$1
+        c=0
+        while [ $c -lt ${#binnum} ]
+        do
+        p=$((${#binnum}-$c-1))
+                decnum=$(($decnum+$(($((${binnum:$c:1}))*$((2**$p))))))
+        c=$(($c+1))
+        done
+        echo $decnum
+}
+
+bin_to_b64(){
+
+        binstr=$1
+        u=0
+        while [ $u -lt ${#binstr} ]
+        do
+                b64str=$b64str$( eval echo \$char$(bin_to_dec `echo ${binstr:$u:6} | sed -e :a -e 's/^.\{1,5\}$/&0/;ta'`) )
+        u=$(($u+6))
+        done
+        echo $b64str
+
+}
+
+base64_encode(){
+
+        rawstr=$@
+        linewidth=64
+        s=0
+        while [ $s -lt ${#rawstr} ]
+        do
+                binout=$binout$( dec_to_bin `printf "%d\n" \'"${rawstr:$s:1}"` )
+        s=$(($s+1))
+        done
+        b64out=$( bin_to_b64 $binout )
+        app=0
+        if [[ $(( ${#rawstr}%3 )) -ne 0 ]]
+        then
+                while [ $app -lt $(( 3-${#rawstr}%3 )) ]
+                do
+                        b64out=$b64out"="
+                app=$(($app+1))
+                done
+        fi
+        echo $b64out
+}
+
+###############################################
+#   BASE64 ASH NATIVE ENCODING FUNCTIONS      #
+###############################################
+
+
+ESX_VERSION=$(vmware -v | awk '{print $3}')
+if [[ "${ESX_VERSION}" != "5.1.0" -a "${ESX_VERSION}" != "5.5.0" ]]
+then
+        echo "Only ESXi version 5.1.0 and 5.5.0 are supported. You are free to try it in previous versions of ESXi but it has not been officially tested"
+        exit 1
+fi
+
+if [ $# -eq 0 ]
+then
+	echo "$help"
+	exit 0
+fi
+
+#if [[ "$@"=="--help" ]]
+#then
+#        echo "$help"
+#        exit 0
+#fi
+
+echo "List of parsed variables:"
+echo "........................."
+
+for block in "$@"
+do
+
+VARNAM=$( echo $block | awk -F "=" '{print $1}' | sed -e 's/^ *//g' -e 's/ *$//g' )
+VARNAM=${VARNAM//-/}
+VARVAL="$( echo $block | awk -F "=" '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' )"
+VARVAL="${VARVAL//"/\"}"
+
+
+echo $VARNAM=\""$VARVAL"\"
+eval $VARNAM=\""$VARVAL"\"
+
+done
+
+echo $longdate
+DO_BACKUP=1
+
+if [ -z ${backuppoint} ]
+then
+	echo "The --backup-point string is a mandatory value"	
+	DO_BACKUP=0
+else
+	if [[ -d "${backuppoint}" ]]
+	then
+		echo "Found --backup-point at ${backuppoint}"
+	else
+		echo "The specified --backup-point=${backuppoint} does not exist"
+		DO_BACKUP=0		
+	fi	
+fi
+
+if [ -z "$backuptype" ]
+then
+        echo "You have to set the variable --backup-type to some of the values described in the help"
+	DO_BACKUP=0
+else
+	if [[ "$backuptype" == "custom" ]]
+	then
+        	if [ -z "$backupvms" ]
+        	then
+                	echo "The --backup-vms string is a mandatory value when --backup-type is set to: "$backuptype
+        		DO_BACKUP=0
+        	fi
+	fi
+fi
+
+SEND_EMAIL=1
+
+if [[ -z ${mailfrom} ]]
+then
+	SEND_EMAIL=0
+	SEND_EMAIL_MSG="The --mail-from string has not been set.$newline"
+fi
+
+if [[ -z ${mailto} ]]
+then
+        SEND_EMAIL=0
+        SEND_EMAIL_MSG=$SEND_EMAIL_MSG"The --mail-to string has not been set.$newline"
+fi
+                
+if [ -z "${subject}" ]
+then
+        subject="ESXi Backup Report. More OSS at http://33hops.com/free-open-source-software.html#xsibackup"
+fi
+  
+if [[ -z ${smtpsrv} ]]
+then
+        SEND_EMAIL=0
+        SEND_EMAIL_MSG=$SEND_EMAIL_MSG"The --smtp-srv string has not been set.$newline"
+fi
+
+#if [[ -z ${smtpauth} ]]
+#then
+#        smtpauth="none"
+#	SEND_EMAIL_MSG=$SEND_EMAIL_MSG"The --smtp-auth string has been set to -none-, if your SMTP server requires authentication please set it to -plain-.$newline"
+#fi
+
+if [[ -z ${smtpusr} ]]
+then
+        if [[ "${smtpauth}" != "none" ]]
+        then
+        	SEND_EMAIL=0
+        	SEND_EMAIL_MSG=$SEND_EMAIL_MSG"The --smtp-usr string has not been set, you need --smtp-usr if --smtp-auth is other than -none-.$newline"
+	fi
+fi
+
+if [[ -z ${smtppwd} ]]
+then
+        if [[ "${smtpauth}" != "none" ]]
+        then
+        	SEND_EMAIL=0
+        	SEND_EMAIL_MSG=$SEND_EMAIL_MSG"The --smtp-pwd string has not been set, you need --smtp-pwd if --smtp-auth is other than -none-.$newline"
+	fi
+fi
+
+#if [[ -e "${busyboxbin}" ]]
+#then
+#                echo "BusyBox binary found at - $busyboxbin -"	
+#else
+#                SEND_EMAIL=0
+#                SEND_EMAIL_MSG=$SEND_EMAIL_MSG"No BusyBox binary has been found in the specified path - $busyboxbin - if you want an e-mail report to be sent you will need BusyBox.$newline"
+#fi
+
+                
+if [[ "${SEND_EMAIL}" == 0 ]]
+then
+        echo "The e-mail report will not be sent becouse of the followig reasons:$newline$SEND_EMAIL_MSG$newline"
+fi
+
+if [[ "${DO_BACKUP}" == 0 ]]
+then
+        echo "The backup will halt here becose some mandatory values are missing"
+        exit 0
+fi
+
+avail_backup_room(){
+
+        OLDIFS=$IFS
+        AVAILS=`df -m`
+        MYPATH=$( getMountedPath $1 )
+        IFS=$newline
+                for line in $AVAILS
+                do
+                DFPATH=$( echo $line | awk '{ print $6 }' )
+                #echo "$DFPATH"
+                        if [[ "${MYPATH#*$DFPATH}" != "$MYPATH" ]]
+                        then
+                         echo $line | awk '{ print $4 }'
+                        fi
+                done
+        IFS=$OLDIFS
+}
+
+get_vm_state(){
+
+        SOUTPUT=$(vim-cmd vmsvc/power.getstate $1 | grep Powered)
+        if [ "$SOUTPUT" = "Powered off" ]
+        then
+                echo "off"
+        else
+                echo "on"
+        fi
+}
+
+checksrv(){
+
+        OLDIFS=$IFS
+        s=0
+        IFS=':'
+        for srvpart in $1
+        do
+                if [[ $s -eq 0 ]]
+                then
+                        srvaddr=$srvpart
+                elif [[ $s -eq 1 ]]
+                then
+                        srvport=$srvpart
+                fi
+        s=$(($s+1))
+        done
+        IFS=$OLDIFS
+        scanresp=`$2 pscan -p $srvport -P $srvport $srvaddr`
+
+        s=0
+        for part in $scanresp
+        do
+
+                if [[ "$s" == 12 ]]
+                then
+                        scanresp=$part
+                fi
+        s=$(($s+1))
+        done
+
+        if [[ "$scanresp" != "open" ]]
+        then
+                echo "The server $1 cannot be contacted"
+                exit
+        else
+                echo $1
+        fi
+
+	IFS=$OLDIFS
+
+}
+
+left_room(){
+
+        OLDIFS=$IFS
+        DFOUT=`df -m`
+        newline=$'\012'
+        IFS=$newline
+        l=0
+        for dfs in $DFOUT
+        do
+                if [[ $l -gt 0 ]]
+                then
+                IFS=$OLDIFS
+                        DEVI=`echo $dfs | awk '{print $6}'`
+                        if [[ "$DEVI" == "$1" ]]
+                        then
+                                ROOMLEFT=`echo $dfs | awk '{print $4}'`
+                        fi
+                fi
+
+        l=$(($l+1))
+        done
+        IFS=$OLDIFS
+        echo $ROOMLEFT
+}
+
+make_room(){
+
+        OLDIFS=$IFS
+        ROOMUSED=`du -sm $2`
+
+        while [[ $1 -gt $(left_room $2)  ]]
+        do
+                OLDESTDIR=`find $2/ -type d -name "$yearstring*" -maxdepth 1 | sort -nr | tail -1`
+                rm -rf $OLDESTDIR
+                DELDIRS=$DELDIRS"<br />"$OLDESTDIR
+
+        done
+        IFS=$OLDIFS
+        echo $DELDIRS
+}
+
+getValue(){
+
+        RawData=`eval $1`
+
+        IFS=$newline
+        for dataline in $RawData
+        do
+                if [[ ${dataline//$2/} != "$dataline" ]]
+                then
+                        if [[ ${dataline//=/} != "$dataline" ]]
+                        then
+
+                                keyval=$dataline
+
+                                if [[ ${dataline//vmfs/} == "$dataline" ]]
+                                then
+                                keyval=${keyval//-/}
+                                fi
+
+                                keyval=${keyval//\"/}
+                                keyval=${keyval//,/}
+                                keyval=${keyval// /}
+                                keyval=${keyval//:/}
+                                echo $keyval
+                                exit 0
+
+                        elif [[ ${dataline//:/} != "$dataline" ]]
+                        then
+
+                                keyval=$dataline
+                                keyval=${keyval//-/}
+                                keyval=${keyval//\"/}
+                                keyval=${keyval//,/}
+                                keyval=${keyval// /}
+                                keyval=${keyval//:/=}
+                                echo $keyval
+                                exit 0
+
+                        else
+
+                                keyval=$dataline
+                                keyval=${keyval//-/}
+                                keyval=${keyval//\"/}
+                                keyval=${keyval//,/}
+                                keyval=${keyval// /}
+                                keyval=`echo $keyval | sed 's/[ \t]\+/ /g'`
+                                keyval=${keyval// /=}
+                                echo $keyval
+                                exit 0
+
+                        fi
+                                exit 0
+
+                fi
+
+        done
+        IFS=$OLDIFS
+
+}
+
+openFirewall(){
+
+   # We check to see if the firewall has the rule yet
+   FWOUT=`esxcli network firewall ruleset list | grep SMTPout`
+
+        if [[ "$FWOUT" == "" ]]
+        then
+                chmod 644 /etc/vmware/firewall/service.xml
+                chmod +t /etc/vmware/firewall/service.xml
+
+                FWRULE="<service id='9999'>
+                <id>SMTPout</id>
+                <rule id='0000'>
+                <direction>outbound</direction>
+                <protocol>tcp</protocol>
+                <porttype>dst</porttype>
+                <port>"$1"</port>
+                </rule>
+                <enabled>true</enabled>
+                <required>false</required>
+                </service>
+                </ConfigRoot>"
+
+                ADDT=`echo $FWRULE | sed 's/$newline//g'`
+                sed -i 's,<\/ConfigRoot>,'"$ADDT"',g' "/etc/vmware/firewall/service.xml"
+
+                chmod 444 /etc/vmware/firewall/service.xml
+                esxcli network firewall refresh
+		
+	else
+		# If the firewall service SMTPout exists we make sure it is open
+		esxcli network firewall ruleset set --ruleset-id=SMTPout --enabled=true
+        fi
+
+}
+
+getFilename(){
+IFS="/"
+for trozo in $1
+do
+        disk=$trozo
+done
+echo $disk
+}
+
+getVMDir(){
+
+        VMDIR=$( vim-cmd vmsvc/get.filelayout $1 | grep vmPathName )
+                ivmd=0
+                IFS="="
+                for pa in $VMDIR
+                do
+                        #pa=${pa// /}
+                        if [ $ivmd -eq 1 ]
+                        then
+                                IFS="]"
+                                ivme=0
+                                for pb in $pa
+                                do
+                                        if [ $ivme -eq 1 ]
+                                        then
+                                                IFS="/"
+                                                ivmf=0
+                                                for pc in $pb
+                                                do
+                                                        if [ $ivmf -eq 0 ]
+                                                        then
+                                                                echo $pc | sed -e 's/^ *//g' -e 's/ *$//g'
+                                                        fi
+                                                ivmf=$(( $ivmf+1 ))
+                                                done
+                                        fi
+                                ivme=$(( $ivme+1 ))
+                                done
+                        fi
+                ivmd=$(( $ivmd+1 ))
+                done
+}
+
+getVMName(){
+
+        VMNAME=$( vim-cmd vmsvc/get.config $1 | grep name )
+        ivmg=0
+        IFS=","
+        for name in $VMNAME
+        do
+                if [ $ivmg -eq 0 ]
+                then
+                        name=${name// = /=}
+                        eval $name
+                        echo $name
+                fi
+        ivmg=$(( $ivmg+1 ))
+        done
+
+}
+
+getVMSize(){
+
+        VMDATA=$(vim-cmd vmsvc/get.datastores $1)
+                IFS=$newline
+                for ds in $VMDATA
+                do
+                ln=$( echo $ds | awk '{ print $1 }' | sed -e 's/^ *//g' -e 's/ *$//g' )
+                if [ $ln = "url" ]
+                then
+                        tkn=0
+                        IFS=$OLDIFS
+                        for tk in $ds
+                        do
+                                if [[ $tk != "url" ]]
+                                then
+                                        VMSize=$( du -hms "$tk/$(getVMDir $1)" | awk '{ print $1 }' )
+                                        VMSizeT=$(( $VMSizeT+$VMSize ))
+                                fi
+                        tkn=$(( $tkn+1 ))
+                        done
+                fi
+                done
+                echo $VMSizeT
+}
+
+getVMXDir(){
+
+        VMDATA=$(vim-cmd vmsvc/get.datastores $1)
+                IFS=$newline
+                for ds in $VMDATA
+                do
+                ln=$( echo $ds | awk '{ print $1 }' | sed -e 's/^ *//g' -e 's/ *$//g' )
+                if [ $ln = "url" ]
+                then
+                        tkn=0
+                        IFS=$OLDIFS
+                        for tk in $ds
+                        do
+                                if [[ $tk != "url" ]]
+                                then
+                                        if [ -e "$tk/$(getVMDir $1)/"*".vmx" ]
+                                        then
+                                                echo $tk"/"$(getVMDir $1)
+                                        fi
+                                fi
+                        tkn=$(( $tkn+1 ))
+                        done
+                fi
+                done
+}
+
+deleteSnapshots(){
+
+        XSIBACKUPSNAPSHOTS=$( vim-cmd vmsvc/snapshot.get $1 | grep xsibackup )
+        IFS=$newline
+        for snap in $XSIBACKUPSNAPSHOTS
+        do
+
+                locstr="${snap//Name/Id}"
+                locstr="${locstr//xsibackup/}"
+                locstr="${locstr// /}"
+                #locstr=${locstr//-/\-}
+                XSIBACKUPSNAPSHOTIDS=$( vim-cmd vmsvc/snapshot.get $1 | grep "Snapshot Id" )
+                for sid in $XSIBACKUPSNAPSHOTIDS
+                do
+                sid="${sid// /}"
+                        if [ "${sid:0:${#locstr}}" = "$locstr" ]
+                        then
+
+                                #echo "${sid:0:${#locstr}}" " => " "$locstr"
+
+                                SNID=$(echo $sid | awk -F ":" '{print $2}')
+                                DELSTR=$DELSTR"vim-cmd vmsvc/snapshot.remove $1 $SNID false 2>&1 >/dev/null;"
+                        fi
+                done
+        done
+        eval $DELSTR
+}
+
+cloneVM(){
+
+        VMXDir=$( getVMXDir "$1" )
+        NAM=$( getVMName $1)
+        VMD=$( getVMDir $1 )
+        if [ -d "$2" ]
+        then
+                rm -rf "$2/"*
+        else
+                mkdir -p "$2"
+        fi
+        cp "$VMXDir/"*".vmx" "$2"
+                RTNDELSNAP=$( deleteSnapshots $1 )
+        ALLVMDK=$( grep vmdk "$VMXDir/"*".vmx" )
+        vim-cmd vmsvc/snapshot.create $1 xsibackup 2>&1 >/dev/null
+        IFS=$newline
+        for eachdisk in $ALLVMDK
+        do
+                IFS="="
+                part=0
+                for eachpart in $eachdisk
+                do
+                        if [[ $part -eq 1 ]]
+                        then
+                                thedisk=${eachpart//\"/}
+                                thedisk=$(echo $thedisk | sed -e 's/^ *//g' -e 's/ *$//g')
+
+                                if [ -e $thedisk ]
+                                then
+                                        vmkfstools -d thin -i "$thedisk" "$2/$(getFilename $thedisk)"
+                                else
+                                        vmkfstools -d thin -i "$VMXDir/$thedisk" "$2/$thedisk"
+                                fi
+                        fi
+                part=$(( $part+1 ))
+                done
+                IFS=$newline
+        done
+        RTNDELSNAP=$( deleteSnapshots $1 )
+}
+
+getMountedPath(){
+
+        OLDIFS=$IFS
+        DIRLIST=$( ls -la /vmfs/volumes )
+        MYPATH=$1
+        PHYS=0
+        IFS=$newline
+                for line in $DIRLIST
+                do
+                THEPART=$( echo $line | awk '{ print $11 }' | sed 's/[ \t]\+/ /g' )
+                THEMOUN=$( echo $line | awk '{ print $9 }' | sed 's/[ \t]\+/ /g' )
+                THEMOUNT="/vmfs/volumes/"$THEMOUN
+
+                if [[ "${MYPATH//$THEPART/}" != "$MYPATH" ]]
+                then
+                        PHYS=1
+                        echo "${MYPATH//$THEPART/$THEMOUN}"
+                fi
+
+                done
+
+                if [ $PHYS -eq 0 ]
+                then
+                        echo "$MYPATH"
+                fi
+
+
+        IFS=$OLDIFS
+
+}
+
+# We define the HTML and table e-mail header
+emailHTMLStr="<html>\n
+		
+		<style type="text/css">\n
+		
+		 body{\n
+                  font-size:14px;\n
+                  font-family:arial,helvetica;\n
+                  font-weight:400;\n
+		  font-color:#777777;	
+		}\n	
+
+		 td{\n
+		  font-size:12px;\n
+		  font-family:arial,helvetica;\n
+		  font-weight:400;\n
+		  border-color:#AAAAAA;\n
+		  border-width: 1px 2px 2px 1px;\n
+		  border-top-style:dotted;\n
+		  border-left-style:dotted;\n
+		  border-right-style:solid;\n
+		  border-bottom-style:solid;\n
+		  margin:0;padding:4px;\n
+		  background-color:#FFFFFF;\n
+		}\n
+	       
+		</style>\n
+		<body>\n
+			<a href=\"http://33hops.com/free-open-source-software.html#xsibackup\"><img src=\"http://www.33hops.com/images/logo1.gif\" border=\"0\"></a><br/><br/>
+			&nbsp;&nbsp;<b>VIRTUAL MACHINE BACKUP REPORT AT HOST:  "$HOSTNAME"</b><br/><br/>
+        		<table width=\"700\" border=\"0\">\n"
+
+echo "Getting list of all VMs..."
+LISTA=`vim-cmd vmsvc/getallvms`
+
+i=0
+IFS=$newline
+for line in $LISTA
+do
+
+echo $line
+
+	if [[ "$i" -gt 0 ]]
+	then
+		VMPID=$(echo $line | awk '{ print $1 }')		
+		
+		VMLDIR=$( getVMDir $VMPID )
+		VMPATH=$( getVMXDir $VMPID )
+		
+		VMSIZE=$( getVMSize $VMPID )
+		VMSALL=$(($VMSALL+$VMSIZE)) 
+		
+		VMNAM=$( getVMName $VMPID )
+		LISTA2=$LISTA2$newline"$line"
+
+		if [[ "$(get_vm_state $VMPID)" == "on" ]]
+		then
+			LISTAON="$LISTAON"$newline"$line"
+			VMSIZON=$(($VMSIZON+VMSIZE))
+		else
+			LISTAOF=$LISTAOF$newline"$line"
+			VMSIZOF=$(($VMSIZOF+VMSIZE))	
+		fi
+
+		IFS=','
+		for svm in $backupvms
+		do
+			if [[ "$svm" == "$VMNAM" ]]
+			then
+				LISTACU=$LISTACU$newline"$line"
+				VMSCUST=$(($VMSCUST+VMSIZE))
+			fi	
+		done
+	
+	fi
+
+i=$(($i+1))
+done
+IFS=$OLDIFS
+
+if [[ "$backuptype" == "custom" ]]
+then
+	LISTA2=$LISTACU
+	VMSALL=$VMSCUST
+fi
+
+if [[ "$backuptype" == "running" ]]
+then
+        LISTA2=$LISTAON
+        VMSALL=$VMSIZON
+fi
+
+	if [[ "$LISTA2" == "" ]]
+        then
+		echo "No VMs to backup"
+                exit 0
+	else        
+		echo "VMs to backup: $LISTA2"
+	fi
+
+
+NEEDED_ROOM=$(($VMSALL/1024))
+AVAILA_ROOM=$(($(avail_backup_room "$backuppoint")/1024))
+
+echo "Needed room: $NEEDED_ROOM Gb."
+echo "Available room: $AVAILA_ROOM Gb."
+
+
+if [[ $(($NEEDED_ROOM+4)) -lt $AVAILA_ROOM ]]
+then
+
+	ENOUGH_ROOM=1
+else	
+
+	ENOUGH_ROOM=0
+	echo "Not enough room to make the backup, some older folders will be deleted."
+fi
+
+if [[ "$testmode" == "true" ]]
+then
+	ENOUGH_ROOM=1
+fi
+
+emailHTMLStr=$emailHTMLStr"<tr>
+                <td colspan=\"8\">Available room in device $backuppoint before backup: "$AVAILA_ROOM" Gb.<br/>
+                		  Needed room in device $backuppoint for backup: "$NEEDED_ROOM" Gb.</td>
+		           </tr>\n"
+
+emailHTMLStr=$emailHTMLStr"<tr>\n
+                <td><b>VM Name</b></td>\n
+		<td><b>State</b></td>\n
+		<td><b>Size</b></td>\n
+                <td><b>Stop</b></td>\n
+                <td><b>Copy</b></td>\n
+                <td><b>Start</b></td>\n
+                <td><b>Time (min)</b></td>\n
+                <td><b>Speed (mb/s)</b></td>\n
+               </tr>\n"
+STARTALL=$(date +%s)
+i=0
+IFS=$newline
+for line in $LISTA2
+do
+
+emailHTMLStr=$emailHTMLStr"<tr>\n"
+
+STARTVM=$(date +%s)
+	
+	VMIDNU=`echo $line | awk '{ print $1 }'`
+	VMNAME=$(getVMName $VMIDNU)
+		emailHTMLStr=$emailHTMLStr"<td><b>"$VMNAME"</b></td>\n"
+	VMSTAT=$(get_vm_state $VMIDNU)	
+		emailHTMLStr=$emailHTMLStr"<td><b>"$VMSTAT"</b></td>\n"
+	VMSIZE=$( getVMSize $VMIDNU )
+		emailHTMLStr=$emailHTMLStr"<td><b>"$(($VMSIZE/1024))"G</b></td>\n"
+	
+	VMLOCA=`echo $line | awk '{ print $8 }'`
+	ETOOLS=$(getValue "vim-cmd vmsvc/get.guest $VMIDNU" "toolsStatus")
+	eval $ETOOLS
+
+	if [[ "$backuphow" == "cold" ]]
+	then
+	
+	if [[ "$VMSTAT" == "on" ]]
+	then	
+	
+	#1	
+	echo "Stopping VM $VMNAME"
+	
+	if [ "$toolsStatus" == "toolsNotInstalled" ]
+	then
+		vim-cmd vmsvc/power.off $VMIDNU
+		echo "No VMware Tools detected in VM: $VMNAME, power-off issued"
+		EXITCODE="OK (Power Off)"
+	else
+		vim-cmd vmsvc/power.shutdown $VMIDNU
+	fi
+	
+	sleep 30
+	echo "SLEEPING 30 s, waiting for VM to be off"	
+			EXITCODE="OK (Shutdown)"	
+	m=0	
+	while [ "$(get_vm_state $VMIDNU)" == "on" ]
+	do
+		
+		if [[ $m -lt 3 ]]
+		then
+		
+			echo "SLEEPING 10 s, waiting for VM to be off"
+			sleep 10
+			EXITCODE="OK (Shutdown)"
+		
+		else
+			
+			#2
+			if [[ $m -eq 3 ]]
+			then
+				vim-cmd vmsvc/power.off $VMIDNU
+				sleep 10
+			fi
+			
+			if [[ $? != 0 ]]
+                        then
+                                EXITCODE="KO (Power Off)"
+                        else
+                                EXITCODE="OK (Power Off)"
+                        fi
+
+		fi
+	
+	m=$(($m+1))
+	done
+
+	else
+		echo "VM $VMNAME was already in an Off state"	
+		EXITCODE="-"
+	fi
+	
+	else
+	
+		echo "Hot backup selected for VM: "$VMNAME" will not be switched off"
+		EXITCODE="NO (hot backup)"
+	
+	fi
+	
+	
+	emailHTMLStr=$emailHTMLStr"<td><b>"$EXITCODE"</b></td>\n"
+
+	if [[ "$testmode" != "true" ]]
+	then		
+		if [[ $ENOUGH_ROOM == 0 ]]
+		then
+			makeRoomHtml=""
+			# Now we make room for the current backup
+			ROOMWENEED=$(( $VMSIZE * (120/100) + 12288 ))
+			echo "Attempting to make room at $backuppoint in local server"
+			MAKEROOMRESP=$(make_room $ROOMWENEED "$backuppoint")	
+
+			if [[ "$MAKEROOMRESP" != "" ]]
+			then
+        			makeRoomHtml="<tr>
+                 		<td colspan=\"8\">The eldest folders were deleted to make room: "$MAKEROOMRESP"</td>
+                		</tr>\n"
+			fi
+		fi
+		
+		VMDIRN=$( getVMDir $VMIDNU )
+		CLONERETURN=$( cloneVM $VMIDNU "$backuppoint/$newdirmask/$VMDIRN" )
+	else
+		echo "Test mode activated VMs will not be cloned, please remove --test-mode=true to allow backups"
+	fi
+
+	sleep 10
+	
+	if [[ $? != 0 ]]
+	then
+		EXITCODE="KO"
+	else
+		EXITCODE="OK"
+	fi
+	emailHTMLStr=$emailHTMLStr"<td><b>"$EXITCODE"</b></td>\n"
+
+	
+	if [[ "$backuphow" == "cold" ]]
+	then
+
+	if [ "$VMSTAT" == "on" ]
+	then
+	
+	#4	
+	vim-cmd vmsvc/power.on $VMIDNU
+	        if [[ $? != 0 ]]
+	        then
+	        	EXITCODE="KO"
+	        else
+	                EXITCODE="OK"
+	        fi
+	else
+			EXITCODE="-"
+	fi        
+
+	else
+	
+		EXITCODE="-"		
+	
+	fi
+
+		emailHTMLStr=$emailHTMLStr"<td><b>"$EXITCODE"</b></td>\n"
+
+
+sleep 1	
+ENDVM=$(date +%s)
+DIFFVM=$(( $ENDVM - $STARTVM ))
+	
+		emailHTMLStr=$emailHTMLStr"
+               <td><b>"$(($DIFFVM/60))"</b></td>\n
+               <td><b>"$(($VMSIZE/$DIFFVM))"</b></td>\n
+             </tr>\n"$makeRoomHtml
+
+i=$(( $i + 1 ))
+done
+IFS=$OLDIFS
+
+ENDALL=$(date +%s)
+DIFFALL=$(( $ENDALL - $STARTALL ))
+
+       	AVAILA_ROOM=$(( $(avail_backup_room $backuppoint)/1024 ))
+
+	emailHTMLStr=$emailHTMLStr"<tr>
+         <td colspan=\"8\">Available space in device $backuppoint after backup: "$AVAILA_ROOM" Gb.</td>
+	</tr>
+	<tr> 
+	 <td colspan=\"8\">Complete backup elapsed time: "$(($DIFFALL/60))" min</td>
+        </tr>\n"
+
+
+# We write the footer of the e-mail
+emailHTMLStr=$emailHTMLStr"\n</table>\n</body>\n</html><br /><br />"
+
+# We send the e-mail
+
+OFRESPONSE=$(openFirewall "$smtpport")
+
+sleep 2
+esxcli network firewall ruleset set --ruleset-id=SMTPout --enabled=true
+esxcli network firewall refresh
+
+if [[ $SEND_EMAIL == 1 ]]
+then
+
+		err_exit() { echo -e 1>&2; exit 1; }
+
+		mail_input() {
+  		echo "helo $hostname"
+  		echo "ehlo $hostname"
+  		echo "AUTH LOGIN"
+  		echo $( base64_encode $smtpusr )
+  		echo $( base64_encode $smtppwd )
+  		echo "MAIL FROM: <${mailfrom}>"
+  		echo "RCPT TO: <${mailto}>"
+  		echo "DATA"
+  		echo "Content-type: text/html"
+  		echo "From: <${mailfrom}>"
+  		echo "To: <${mailto}>"
+  		echo "Subject: ${subject}"
+  		#echo "Subject: ESXi Backup Report. More OSS at http://33hops.com/free-open-source-software.html"
+  		echo ${emailHTMLStr//\\n/$newline}
+  		echo "."
+  		echo "quit"
+		}
+
+		mail_input | nc $smtpsrv $smtpport || err_exit
+
+		# We close the SMTP port
+		esxcli network firewall ruleset set --ruleset-id=SMTPout --enabled=false
+		
+		#echo -e "Content-type: text/html\nFrom: ${mailfrom}\nTo:${mailto}\nSubject:${subject}\n"$emailHTMLStr | ${busyboxbin} sendmail -t -f ${mailfrom} -S $smtpsrv $authstring
+		
+fi
