@@ -26,7 +26,7 @@ HOSTNAME=$(hostname)
 CURRDIR=`dirname $0`
 
 longdate=`date '+%a, %d %b %Y %H:%M:%S %z'`
-newdirmask=$(date +%Y%m%d''%H%M%S)
+newdirmask=$(date +%Y%m%d)
 yearstring=$(date +%Y)
 
 OLDIFS=$IFS
